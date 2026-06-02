@@ -1,129 +1,109 @@
 import csv
-import time
-from urllib.parse import urljoin, urlparse
-
 import requests
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BASE_URL = "https://www.floortrends.ie"
-SITEMAP_URL = "https://www.floortrends.ie/sitemap"
+SITEMAP_URL = "https://www.floortrends.ie/sitemap.xml"
 OUTPUT_FILE = "stock.csv"
+DEFAULT_QTY = 3
+MAX_WORKERS = 8
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (MacCarthys Stock Feed)"
 }
 
 BLOCKED_WORDS = [
-    "login",
-    "account",
-    "cart",
-    "checkout",
-    "wishlist",
-    "contact",
-    "privacy",
-    "terms",
-    "search",
-    "blog",
-    "news",
-    "sitemap",
+    "login", "account", "cart", "checkout", "wishlist",
+    "contact", "privacy", "terms", "search", "blog", "news"
 ]
 
-def clean_url(href):
-    full_url = urljoin(BASE_URL, href)
-    parsed = urlparse(full_url)
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-
-def get_soup(url):
+def get_url(url):
     response = requests.get(url, headers=HEADERS, timeout=30)
     response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
+    return response.text
 
 def is_allowed_url(url):
-    if not url.startswith(BASE_URL):
+    lower = url.lower()
+    if not lower.startswith("https://www.floortrends.ie/"):
         return False
+    return not any(word in lower for word in BLOCKED_WORDS)
 
-    lower_url = url.lower()
+def read_sitemap(url):
+    xml_text = get_url(url)
+    root = ET.fromstring(xml_text)
 
-    for word in BLOCKED_WORDS:
-        if word in lower_url:
-            return False
+    urls = set()
+    sitemaps = []
 
-    return True
+    for elem in root.iter():
+        tag = elem.tag.lower()
+        if tag.endswith("loc") and elem.text:
+            loc = elem.text.strip()
 
-def get_links_from_page(url):
-    soup = get_soup(url)
-    links = set()
+            if loc.endswith(".xml"):
+                sitemaps.append(loc)
+            elif is_allowed_url(loc):
+                urls.add(loc)
 
-    for a in soup.select("a[href]"):
-        link = clean_url(a["href"])
+    for sitemap in sitemaps:
+        try:
+            urls.update(read_sitemap(sitemap))
+        except Exception as error:
+            print(f"Skipped sitemap {sitemap}: {error}")
 
-        if is_allowed_url(link):
-            links.add(link)
+    return urls
 
-    return links
-
-def scrape_product_page(url):
-    soup = get_soup(url)
-    rows = []
-
-    for block in soup.select(".product-variant-line"):
-        sku_el = block.select_one(".sku .value")
-        stock_el = block.select_one(".availability .value")
-
-        if not sku_el:
-            continue
-
-        sku = sku_el.get_text(strip=True)
-
-        if not sku:
-            continue
-
-        stock_text = stock_el.get_text(strip=True) if stock_el else ""
-
-        if stock_text.lower() == "in stock":
-            quantity = 3
-        else:
-            quantity = 0
-
-        rows.append({
-            "SKU": sku,
-            "QTY": quantity
-        })
-
-    return rows
-
-print("Step 1: Reading sitemap/category links")
-category_links = get_links_from_page(SITEMAP_URL)
-print(f"Links found from sitemap: {len(category_links)}")
-
-print("Step 2: Finding product pages")
-product_links = set()
-
-for category_url in sorted(category_links):
+def scrape_page(url):
     try:
-        links = get_links_from_page(category_url)
+        html = get_url(url)
+        soup = BeautifulSoup(html, "html.parser")
 
-        for link in links:
-            rows = scrape_product_page(link)
+        rows = []
 
-            if rows:
-                product_links.add(link)
-                print(f"Product page found: {link}")
+        for block in soup.select(".product-variant-line"):
+            sku_el = block.select_one(".sku .value")
+            stock_el = block.select_one(".availability .value")
 
-        time.sleep(0.5)
+            if not sku_el:
+                continue
+
+            sku = sku_el.get_text(strip=True)
+            stock_text = stock_el.get_text(strip=True) if stock_el else ""
+
+            if not sku:
+                continue
+
+            quantity = DEFAULT_QTY if stock_text.lower() == "in stock" else 0
+
+            rows.append({
+                "SKU": sku,
+                "QTY": quantity
+            })
+
+        if rows:
+            print(f"Found {len(rows)} SKUs: {url}")
+
+        return rows
 
     except Exception as error:
-        print(f"Skipped category {category_url}: {error}")
+        print(f"Skipped {url}: {error}")
+        return []
 
-print(f"Product pages found: {len(product_links)}")
+print("Reading XML sitemap...")
+urls = sorted(read_sitemap(SITEMAP_URL))
+print(f"URLs found in sitemap: {len(urls)}")
 
-print("Step 3: Scraping variant stock")
 all_rows = []
 seen_skus = set()
 
-for product_url in sorted(product_links):
-    try:
-        rows = scrape_product_page(product_url)
+print("Scraping pages...")
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = [executor.submit(scrape_page, url) for url in urls]
+
+    for future in as_completed(futures):
+        rows = future.result()
 
         for row in rows:
             sku = row["SKU"]
@@ -134,13 +114,10 @@ for product_url in sorted(product_links):
             seen_skus.add(sku)
             all_rows.append(row)
 
-        time.sleep(0.5)
-
-    except Exception as error:
-        print(f"Skipped product {product_url}: {error}")
-
 if len(all_rows) < 10:
     raise Exception(f"Only found {len(all_rows)} SKUs. Stopping safely.")
+
+all_rows = sorted(all_rows, key=lambda row: row["SKU"])
 
 with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as file:
     writer = csv.DictWriter(file, fieldnames=["SKU", "QTY"])
